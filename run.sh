@@ -15,7 +15,7 @@ source "$VENV_DIR/bin/activate"
 
 # Install dependencies if not already installed
 pip install --quiet --upgrade pip
-pip install --quiet beautifulsoup4 pandas requests pyexiftool Pillow lxml
+pip install --quiet beautifulsoup4 pandas requests pyexiftool Pillow lxml html5lib
 
 # Run the downloader, passing through all arguments
 python "$SCRIPT_DIR/snapchat_memories_downloader.py" "$@"
