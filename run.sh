@@ -14,13 +14,19 @@ if [ $# -eq 0 ]; then
     echo "╚══════════════════════════════════════╝"
     echo ""
 
-    # Pick input folder/file
-    echo "Select your Snapchat export (folder or zip)..."
-    INPUT=$(osascript -e 'tell application "Finder" to activate' \
-           -e 'set f to choose folder with prompt "Select your Snapchat memories folder (or folder of zips)"' \
+    # Pick input folder or HTML file
+    echo "Select your Snapchat export (folder or HTML file)..."
+    INPUT=$(osascript \
+           -e 'tell application "Finder" to activate' \
+           -e 'set f to choose file with prompt "Select your memories HTML file or click Cancel to pick a folder instead" of type {"public.html"}' \
            -e 'return POSIX path of f' 2>/dev/null) || {
-        echo "No folder selected. Exiting."
-        exit 1
+        # User cancelled file picker — try folder picker instead
+        INPUT=$(osascript -e 'tell application "Finder" to activate' \
+               -e 'set f to choose folder with prompt "Select your Snapchat memories folder (or folder of zips)"' \
+               -e 'return POSIX path of f' 2>/dev/null) || {
+            echo "No input selected. Exiting."
+            exit 1
+        }
     }
     echo "  Input: $INPUT"
 
@@ -65,7 +71,7 @@ fi
 
 # Install Python dependencies
 pip install --quiet --upgrade pip
-pip install --quiet beautifulsoup4 pyexiftool Pillow
+pip install --quiet beautifulsoup4 pyexiftool Pillow requests
 
 # ─── Run ─────────────────────────────────────────────────────────────────────
 
