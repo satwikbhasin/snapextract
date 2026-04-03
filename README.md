@@ -5,9 +5,12 @@ Extract and fix metadata on your Snapchat Memories export.
 ## What it does
 
 - Downloads all memories from Snapchat's CDN using your export's `memories_history.html`
-- Writes correct capture dates and GPS coordinates into EXIF/XMP metadata
-- Sets OS file timestamps to the original capture date
-- Falls back to local `memories.html` exports (composites overlay images/filters onto base photos and videos)
+- Composites Snapchat overlays (filters, text, stickers) onto base photos and videos
+- Writes correct capture dates and GPS coordinates into EXIF/XMP/QuickTime metadata
+- Sets OS file timestamps (created + modified) to the original capture date
+- Downloads in parallel (8 workers) with automatic retry on failures
+- Extracts zip files automatically from input folders
+- Falls back to local `memories.html` exports when CDN links aren't available
 
 ## Quick start
 
@@ -15,12 +18,14 @@ Extract and fix metadata on your Snapchat Memories export.
 ./run.sh
 ```
 
-That's it. Two dialogs will pop up:
+That's it. Two dialogs will pop up (macOS):
 
 1. **Select your input** — pick the `memories_history.html` file directly, or cancel to pick a folder instead
 2. **Select your output** — where you want the processed memories saved
 
 Everything else (Python venv, dependencies, ffmpeg, exiftool) is installed automatically.
+
+> **Important:** CDN download links expire ~12-24 hours after export. Run SnapExtract soon after requesting your data from Snapchat.
 
 ## Input formats
 
@@ -28,7 +33,7 @@ SnapExtract supports two Snapchat export formats:
 
 | Format | File | What it has |
 |---|---|---|
-| **History export** (preferred) | `memories_history.html` | Full timestamps, GPS, CDN download links for all memories |
+| **History export** (preferred) | `memories_history.html` | Full timestamps, GPS, CDN download links, overlays |
 | **Local export** (fallback) | `memories.html` | Local media files with overlays, date only (no time/GPS) |
 
 If both formats are found, the history export is used automatically since it has richer data.
@@ -50,6 +55,12 @@ If both formats are found, the history export is used automatically since it has
 | `-d`, `--download-dir` | Output directory |
 | `--skip-metadata` | Skip EXIF/XMP metadata updates |
 
+## Error handling
+
+- Failed downloads are automatically retried up to 4 times (5 total attempts) with exponential backoff
+- Permanently failed downloads are saved to `failed_downloads.txt` in the output directory
+- Already-downloaded files are skipped on re-runs, so you can safely re-run to pick up failures
+
 ## Requirements
 
 - macOS or Linux
@@ -57,6 +68,6 @@ If both formats are found, the history export is used automatically since it has
 
 The following are installed automatically by `run.sh` (via Homebrew, apt, dnf, or pacman):
 
-- **exiftool** — for writing EXIF/XMP metadata
-- **ffmpeg** — for compositing overlays onto videos (local export only)
+- **exiftool** — for writing EXIF/XMP/QuickTime metadata
+- **ffmpeg** — for compositing overlays onto videos
 - **beautifulsoup4**, **pyexiftool**, **Pillow**, **requests** — Python libraries (see `requirements.txt`)

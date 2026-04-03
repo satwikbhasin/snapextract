@@ -13,14 +13,17 @@ Usage:
 
 import argparse
 import calendar
+import io
 import logging
 import os
 import re
 import shutil
 import subprocess
 import sys
+import time
 import zipfile
-from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
 from urllib.parse import parse_qs, urlparse
 
 import requests
@@ -108,103 +111,199 @@ def parse_history_html(html_path: str) -> list[dict]:
 def _make_session() -> requests.Session:
     """Create a requests session with retry logic for transient failures."""
     session = requests.Session()
-    retry = Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
-    adapter = HTTPAdapter(max_retries=retry)
+    retry = Retry(total=3, backoff_factor=2, status_forcelist=[429, 500, 502, 503, 504])
+    adapter = HTTPAdapter(max_retries=retry, pool_connections=MAX_WORKERS * 2, pool_maxsize=MAX_WORKERS * 2)
     session.mount("https://", adapter)
     session.mount("http://", adapter)
     return session
 
 
-def download_from_cdn(entries: list[dict], output_dir: str) -> list[dict]:
-    """Download all entries from CDN and return output records."""
-    total = len(entries)
-    log.info(f"Downloading {total} memories from Snapchat CDN...")
-
-    session = _make_session()
-    outputs = []
-    downloaded = 0
-    errors = 0
-
-    for i, entry in enumerate(entries):
-        cdn_url = entry["cdn_url"]
-        media_type = entry["media_type"]
-        date_str = entry["date"]
-
-        # Build filename from date + index
-        try:
-            dt = datetime.strptime(date_str.replace(" UTC", "").strip(), "%Y-%m-%d %H:%M:%S")
-        except ValueError:
-            dt = datetime.strptime(date_str.strip(), "%Y-%m-%d")
-        ts_str = dt.strftime("%Y-%m-%d_%H-%M-%S")
-
-        # Extract SID for unique naming
-        parsed = urlparse(cdn_url)
+def _check_url_expiry(entries: list[dict]):
+    """Warn if CDN URLs appear to be expired based on their ts parameter."""
+    for entry in entries[:1]:
+        parsed = urlparse(entry["cdn_url"])
         params = parse_qs(parsed.query)
-        sid = params.get("sid", [f"unknown_{i}"])[0]
-        short_id = sid[:8]
+        ts_values = params.get("ts", [])
+        if not ts_values:
+            return
+        try:
+            url_ts = int(ts_values[0]) / 1000  # ms to seconds
+            now_ts = calendar.timegm(datetime.now(timezone.utc).timetuple())
+            age_hours = (now_ts - url_ts) / 3600
+            if age_hours > 12:
+                log.warning(f"CDN URLs were generated {age_hours:.0f} hours ago and may have expired.")
+                log.warning("If downloads fail with 403, re-request your export from Snapchat for fresh links.")
+        except (ValueError, IndexError):
+            pass
 
-        ext = ".jpg" if media_type == "image" else ".mp4"
-        filename = f"{ts_str}_{short_id}{ext}"
-        out_path = os.path.join(output_dir, filename)
 
-        # Skip if already downloaded
-        if os.path.exists(out_path):
-            outputs.append({
-                "date": date_str,
-                "file_path": out_path,
-                "lat": entry.get("lat"),
-                "lon": entry.get("lon"),
-            })
-            downloaded += 1
-            done = i + 1
-            if done % 100 == 0 or done == total:
-                log.info(f"  [{done}/{total}] {downloaded} downloaded, {errors} errors (skipped existing)")
-            continue
+def _download_one(session: requests.Session, entry: dict, i: int, output_dir: str) -> dict | None:
+    """Download and process a single CDN entry. Returns output record or None on failure."""
+    cdn_url = entry["cdn_url"]
+    media_type = entry["media_type"]
+    date_str = entry["date"]
 
+    try:
+        dt = datetime.strptime(date_str.replace(" UTC", "").strip(), "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        dt = datetime.strptime(date_str.strip(), "%Y-%m-%d")
+    ts_str = dt.strftime("%Y-%m-%d_%H-%M-%S")
+
+    parsed = urlparse(cdn_url)
+    params = parse_qs(parsed.query)
+    sid = params.get("sid", [f"unknown_{i}"])[0]
+    short_id = sid[:8]
+
+    ext = ".jpg" if media_type == "image" else ".mp4"
+    filename = f"{ts_str}_{short_id}{ext}"
+    out_path = os.path.join(output_dir, filename)
+
+    # Skip if already downloaded
+    if os.path.exists(out_path):
+        return {"date": date_str, "file_path": out_path, "lat": entry.get("lat"), "lon": entry.get("lon"), "skipped": True}
+
+    # Retry with exponential backoff on server errors
+    max_attempts = 5
+    for attempt in range(max_attempts):
         try:
             resp = session.get(
                 cdn_url,
                 headers={"X-Snap-Route-Tag": "mem-dmd"},
-                timeout=60,
-                stream=True,
+                timeout=120,
             )
             resp.raise_for_status()
+            break
+        except (requests.exceptions.HTTPError, requests.exceptions.ConnectionError) as e:
+            is_403 = isinstance(e, requests.exceptions.HTTPError) and e.response is not None and e.response.status_code == 403
+            if is_403 or attempt == max_attempts - 1:
+                raise
+            wait = 2 ** attempt + 1  # 2, 3, 5, 9
+            time.sleep(wait)
 
-            # Detect actual content type and fix extension
-            content_type = resp.headers.get("Content-Type", "")
-            if "video" in content_type and ext != ".mp4":
-                ext = ".mp4"
-                filename = f"{ts_str}_{short_id}{ext}"
-                out_path = os.path.join(output_dir, filename)
-            elif "image" in content_type and ext == ".mp4":
-                if "png" in content_type:
-                    ext = ".png"
+    content_type = resp.headers.get("Content-Type", "")
+
+    if "zip" in content_type or resp.content[:4] == b"PK\x03\x04":
+        zf = zipfile.ZipFile(io.BytesIO(resp.content))
+        names = [n for n in zf.namelist() if not n.startswith("__MACOSX") and not n.startswith(".")]
+        if not names:
+            raise ValueError("Zip contains no media files")
+
+        main_name = next((n for n in names if "-main" in n.lower()), None)
+        overlay_name = next((n for n in names if "-overlay" in n.lower()), None)
+        if not main_name:
+            main_name = names[0]
+
+        actual_ext = os.path.splitext(main_name)[1].lower() or ext
+        filename = f"{ts_str}_{short_id}{actual_ext}"
+        out_path = os.path.join(output_dir, filename)
+
+        if main_name and overlay_name:
+            main_data = zf.read(main_name)
+            overlay_data = zf.read(overlay_name)
+            main_tmp = os.path.join(output_dir, f".tmp_main_{short_id}_{i}{actual_ext}")
+            overlay_tmp = os.path.join(output_dir, f".tmp_overlay_{short_id}_{i}.png")
+            try:
+                with open(main_tmp, "wb") as f:
+                    f.write(main_data)
+                with open(overlay_tmp, "wb") as f:
+                    f.write(overlay_data)
+
+                if actual_ext in VIDEO_EXTS:
+                    if not _composite_video(main_tmp, overlay_tmp, out_path):
+                        shutil.copy2(main_tmp, out_path)
                 else:
-                    ext = ".jpg"
-                filename = f"{ts_str}_{short_id}{ext}"
-                out_path = os.path.join(output_dir, filename)
-
+                    try:
+                        _composite_image(main_tmp, overlay_tmp, out_path)
+                    except Exception:
+                        shutil.copy2(main_tmp, out_path)
+            finally:
+                for tmp in (main_tmp, overlay_tmp):
+                    if os.path.exists(tmp):
+                        os.remove(tmp)
+        else:
             with open(out_path, "wb") as f:
-                for chunk in resp.iter_content(chunk_size=8192):
-                    f.write(chunk)
+                f.write(zf.read(main_name))
+    else:
+        if "video" in content_type and ext != ".mp4":
+            ext = ".mp4"
+        elif "image" in content_type and ext == ".mp4":
+            ext = ".png" if "png" in content_type else ".jpg"
+        filename = f"{ts_str}_{short_id}{ext}"
+        out_path = os.path.join(output_dir, filename)
+        with open(out_path, "wb") as f:
+            f.write(resp.content)
 
-            downloaded += 1
-            outputs.append({
-                "date": date_str,
-                "file_path": out_path,
-                "lat": entry.get("lat"),
-                "lon": entry.get("lon"),
-            })
+    return {"date": date_str, "file_path": out_path, "lat": entry.get("lat"), "lon": entry.get("lon")}
 
-        except Exception as e:
-            errors += 1
-            log.warning(f"  Download failed for {filename}: {e}")
 
-        done = i + 1
-        if done % 100 == 0 or done == total:
-            log.info(f"  [{done}/{total}] {downloaded} downloaded, {errors} errors")
+MAX_WORKERS = 8
 
-    log.info(f"Download complete: {downloaded} ok, {errors} errors")
+
+def _run_download_batch(session: requests.Session, entries: list[dict], output_dir: str) -> tuple[list[dict], list[dict]]:
+    """Download a batch of entries in parallel. Returns (outputs, failed_entries)."""
+    total = len(entries)
+    outputs = []
+    failed = []
+    downloaded = 0
+    errors = 0
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+        future_to_entry = {}
+        for i, entry in enumerate(entries):
+            fut = pool.submit(_download_one, session, entry, i, output_dir)
+            future_to_entry[fut] = (i, entry)
+
+        for fut in as_completed(future_to_entry):
+            i, entry = future_to_entry[fut]
+            try:
+                result = fut.result()
+                if result:
+                    outputs.append(result)
+                    downloaded += 1
+            except requests.exceptions.HTTPError as e:
+                errors += 1
+                is_403 = e.response is not None and e.response.status_code == 403
+                if not is_403:
+                    failed.append(entry)
+            except Exception:
+                errors += 1
+                failed.append(entry)
+
+            done = downloaded + errors
+            if done % 100 == 0 or done == total:
+                log.info(f"  [{done}/{total}] {downloaded} downloaded, {errors} errors")
+
+    return outputs, failed
+
+
+def download_from_cdn(entries: list[dict], output_dir: str) -> list[dict]:
+    """Download all entries from CDN in parallel with retry prompt for failures."""
+    total = len(entries)
+    log.info(f"Downloading {total} memories from Snapchat CDN ({MAX_WORKERS} parallel workers)...")
+    _check_url_expiry(entries)
+
+    session = _make_session()
+    outputs, failed = _run_download_batch(session, entries, output_dir)
+
+    log.info(f"Download complete: {len(outputs)} ok, {total - len(outputs)} errors")
+
+    for attempt in range(2, 5):  # up to 3 retries
+        if not failed:
+            break
+        log.info(f"{len(failed)} downloads failed. Retrying (attempt {attempt}/4)...")
+        new_outputs, failed = _run_download_batch(session, failed, output_dir)
+        outputs.extend(new_outputs)
+        if new_outputs:
+            log.info(f"  Recovered {len(new_outputs)} files on attempt {attempt}")
+
+    if failed:
+        failed_log = os.path.join(output_dir, "failed_downloads.txt")
+        with open(failed_log, "w") as f:
+            for entry in failed:
+                f.write(f"{entry['date']} | {entry['media_type']} | {entry['cdn_url']}\n")
+        log.warning(f"{len(failed)} files could not be downloaded after retries.")
+        log.warning(f"Failed URLs saved to: {failed_log}")
+
     return outputs
 
 
@@ -406,31 +505,56 @@ def update_metadata(outputs: list[dict]):
                     dt_obj = datetime.strptime(date_str, "%Y-%m-%d")
                     exif_dt = dt_obj.strftime("%Y:%m:%d 12:00:00")
 
-                tags = [
-                    "-overwrite_original",
-                    f"-XMP:DateTimeOriginal={exif_dt}",
-                    f"-XMP:CreateDate={exif_dt}",
-                    f"-DateTimeOriginal={exif_dt}",
-                    f"-CreateDate={exif_dt}",
-                    f"-ModifyDate={exif_dt}",
-                ]
+                file_ext = os.path.splitext(fpath)[1].lower()
+                is_video = file_ext in VIDEO_EXTS
+
+                tags = ["-overwrite_original"]
+
+                if is_video:
+                    # QuickTime tags for video files
+                    tags.extend([
+                        f"-QuickTime:CreateDate={exif_dt}",
+                        f"-QuickTime:ModifyDate={exif_dt}",
+                        f"-QuickTime:TrackCreateDate={exif_dt}",
+                        f"-QuickTime:TrackModifyDate={exif_dt}",
+                        f"-QuickTime:MediaCreateDate={exif_dt}",
+                        f"-QuickTime:MediaModifyDate={exif_dt}",
+                    ])
+                else:
+                    # EXIF/XMP tags for image files
+                    tags.extend([
+                        f"-EXIF:DateTimeOriginal={exif_dt}",
+                        f"-EXIF:CreateDate={exif_dt}",
+                        f"-EXIF:ModifyDate={exif_dt}",
+                        f"-XMP:DateTimeOriginal={exif_dt}",
+                        f"-XMP:CreateDate={exif_dt}",
+                    ])
 
                 # Add GPS if available
                 if lat is not None and lon is not None:
                     lat_ref = "N" if lat >= 0 else "S"
                     lon_ref = "E" if lon >= 0 else "W"
-                    tags.extend([
-                        f"-GPSLatitude={abs(lat)}",
-                        f"-GPSLatitudeRef={lat_ref}",
-                        f"-GPSLongitude={abs(lon)}",
-                        f"-GPSLongitudeRef={lon_ref}",
-                    ])
+                    if is_video:
+                        # QuickTime GPS as coordinate string
+                        lat_signed = lat
+                        lon_signed = lon
+                        tags.append(f"-Keys:GPSCoordinates={lat_signed} {lon_signed}")
+                    else:
+                        tags.extend([
+                            f"-GPSLatitude={abs(lat)}",
+                            f"-GPSLatitudeRef={lat_ref}",
+                            f"-GPSLongitude={abs(lon)}",
+                            f"-GPSLongitudeRef={lon_ref}",
+                        ])
 
                 et.execute(*tags, fpath)
 
-                # Set OS file times (use calendar.timegm for UTC)
-                unix_ts = calendar.timegm(dt_obj.timetuple())
-                os.utime(fpath, (unix_ts, unix_ts))
+                # Set filesystem dates in a separate call (after metadata write)
+                et.execute(
+                    f"-FileCreateDate={exif_dt}",
+                    f"-FileModifyDate={exif_dt}",
+                    fpath,
+                )
 
                 updated += 1
                 if updated % 100 == 0 or updated == total:
