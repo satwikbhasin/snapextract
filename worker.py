@@ -7,11 +7,12 @@ Supports two Snapchat export formats:
   2. memories.html — div-based with local media files, date-only
 
 Usage:
-    python snapchat_memories_downloader.py -i /path/to/export -d /path/to/output
-    python snapchat_memories_downloader.py -i /path/to/export -d /path/to/output --skip-metadata
+    python worker.py -i /path/to/export -d /path/to/output
+    python worker.py -i /path/to/export -d /path/to/output --skip-metadata
 """
 
 import argparse
+import calendar
 import logging
 import os
 import re
@@ -23,6 +24,8 @@ from datetime import datetime
 from urllib.parse import parse_qs, urlparse
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from bs4 import BeautifulSoup
 from exiftool import ExifToolHelper
 from PIL import Image
@@ -102,11 +105,22 @@ def parse_history_html(html_path: str) -> list[dict]:
     return entries
 
 
+def _make_session() -> requests.Session:
+    """Create a requests session with retry logic for transient failures."""
+    session = requests.Session()
+    retry = Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
+
+
 def download_from_cdn(entries: list[dict], output_dir: str) -> list[dict]:
     """Download all entries from CDN and return output records."""
     total = len(entries)
     log.info(f"Downloading {total} memories from Snapchat CDN...")
 
+    session = _make_session()
     outputs = []
     downloaded = 0
     errors = 0
@@ -118,9 +132,9 @@ def download_from_cdn(entries: list[dict], output_dir: str) -> list[dict]:
 
         # Build filename from date + index
         try:
-            dt = datetime.strptime(date_str, "%Y-%m-%d %H:%M:%S %Z")
+            dt = datetime.strptime(date_str.replace(" UTC", "").strip(), "%Y-%m-%d %H:%M:%S")
         except ValueError:
-            dt = datetime.strptime(date_str.replace(" UTC", ""), "%Y-%m-%d %H:%M:%S")
+            dt = datetime.strptime(date_str.strip(), "%Y-%m-%d")
         ts_str = dt.strftime("%Y-%m-%d_%H-%M-%S")
 
         # Extract SID for unique naming
@@ -148,10 +162,11 @@ def download_from_cdn(entries: list[dict], output_dir: str) -> list[dict]:
             continue
 
         try:
-            resp = requests.get(
+            resp = session.get(
                 cdn_url,
                 headers={"X-Snap-Route-Tag": "mem-dmd"},
                 timeout=60,
+                stream=True,
             )
             resp.raise_for_status()
 
@@ -170,7 +185,8 @@ def download_from_cdn(entries: list[dict], output_dir: str) -> list[dict]:
                 out_path = os.path.join(output_dir, filename)
 
             with open(out_path, "wb") as f:
-                f.write(resp.content)
+                for chunk in resp.iter_content(chunk_size=8192):
+                    f.write(chunk)
 
             downloaded += 1
             outputs.append({
@@ -412,8 +428,8 @@ def update_metadata(outputs: list[dict]):
 
                 et.execute(*tags, fpath)
 
-                # Set OS file times
-                unix_ts = dt_obj.timestamp()
+                # Set OS file times (use calendar.timegm for UTC)
+                unix_ts = calendar.timegm(dt_obj.timetuple())
                 os.utime(fpath, (unix_ts, unix_ts))
 
                 updated += 1
@@ -447,7 +463,12 @@ def _extract_zips(input_path: str) -> list[str]:
         log.info(f"  Extracting: {name}")
         try:
             with zipfile.ZipFile(zip_path, "r") as zf:
-                zf.extractall(dest)
+                for member in zf.namelist():
+                    member_path = os.path.realpath(os.path.join(dest, member))
+                    if not member_path.startswith(os.path.realpath(dest) + os.sep) and member_path != os.path.realpath(dest):
+                        log.warning(f"  Skipping suspicious zip entry: {member}")
+                        continue
+                    zf.extract(member, dest)
             extracted.append(dest)
         except zipfile.BadZipFile:
             log.warning(f"  Bad zip file: {name}")

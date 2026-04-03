@@ -52,11 +52,11 @@ If both formats are found, the history export is used automatically since it has
 
 ## Requirements
 
-- macOS (uses Homebrew for system deps)
+- macOS or Linux
 - Python 3.10+
 
-The following are installed automatically by `run.sh`:
+The following are installed automatically by `run.sh` (via Homebrew, apt, dnf, or pacman):
 
 - **exiftool** — for writing EXIF/XMP metadata
 - **ffmpeg** — for compositing overlays onto videos (local export only)
-- **beautifulsoup4**, **pyexiftool**, **Pillow**, **requests** — Python libraries
+- **beautifulsoup4**, **pyexiftool**, **Pillow**, **requests** — Python libraries (see `requirements.txt`)

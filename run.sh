@@ -55,24 +55,34 @@ fi
 # Activate venv
 source "$VENV_DIR/bin/activate"
 
-# Install system dependencies via Homebrew if missing
-if command -v brew &> /dev/null; then
-    if ! command -v exiftool &> /dev/null; then
-        echo "Installing exiftool..."
-        brew install exiftool
+# Install system dependencies
+install_sys_dep() {
+    local cmd="$1"
+    local apt_pkg="${2:-$1}"
+    if command -v "$cmd" &> /dev/null; then
+        return
     fi
-    if ! command -v ffmpeg &> /dev/null; then
-        echo "Installing ffmpeg..."
-        brew install ffmpeg
+    echo "Installing $cmd..."
+    if command -v brew &> /dev/null; then
+        brew install "$cmd"
+    elif command -v apt-get &> /dev/null; then
+        sudo apt-get install -y "$apt_pkg"
+    elif command -v dnf &> /dev/null; then
+        sudo dnf install -y "$cmd"
+    elif command -v pacman &> /dev/null; then
+        sudo pacman -S --noconfirm "$cmd"
+    else
+        echo "Warning: Could not install $cmd automatically. Please install it manually."
     fi
-else
-    echo "Warning: Homebrew not found. Please install exiftool and ffmpeg manually."
-fi
+}
+
+install_sys_dep exiftool libimage-exiftool-perl
+install_sys_dep ffmpeg
 
 # Install Python dependencies
 pip install --quiet --upgrade pip
-pip install --quiet beautifulsoup4 pyexiftool Pillow requests
+pip install --quiet -r "$SCRIPT_DIR/requirements.txt"
 
 # ─── Run ─────────────────────────────────────────────────────────────────────
 
-python "$SCRIPT_DIR/snapchat_memories_downloader.py" "$@"
+python "$SCRIPT_DIR/worker.py" "$@"
