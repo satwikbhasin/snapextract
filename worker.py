@@ -56,6 +56,13 @@ MAX_WORKERS_LIMIT = 50
 
 # ─── Logging ─────────────────────────────────────────────────────────────────
 
+# Shared lock — both the log handler and the progress bar must hold this
+# before writing to stderr so they never interleave.
+_print_lock = threading.Lock()
+
+# The last progress bar string, so the handler can redraw it after a log line.
+_current_bar: str = ""
+
 
 class _ColoredFormatter(logging.Formatter):
     _COLORS = {
@@ -69,12 +76,43 @@ class _ColoredFormatter(logging.Formatter):
 
     def format(self, record: logging.LogRecord) -> str:
         color = self._COLORS.get(record.levelname, "")
-        record.colored_levelname = f"{color}{record.levelname:<7}{self._RESET}" if color else record.levelname
+        record.colored_levelname = (
+            f"{color}{record.levelname:<7}{self._RESET}" if color else record.levelname
+        )
         return super().format(record)
 
 
+class _BarAwareHandler(logging.StreamHandler):
+    """
+    A stderr log handler that is aware of the progress bar.
+
+    Before emitting a log line it:
+      1. Erases the current progress bar line (\r + \033[2K).
+      2. Prints the log line normally (with newline).
+      3. Redraws the last known progress bar so it stays at the bottom.
+
+    All three steps happen under _print_lock so no thread can interleave.
+    """
+
+    def emit(self, record: logging.LogRecord) -> None:
+        global _current_bar
+        try:
+            msg = self.format(record)
+            with _print_lock:
+                # 1. Erase bar
+                sys.stderr.write("\r\033[2K")
+                # 2. Log line
+                sys.stderr.write(msg + "\n")
+                # 3. Redraw bar (if one exists)
+                if _current_bar:
+                    sys.stderr.write(_current_bar)
+                sys.stderr.flush()
+        except Exception:
+            self.handleError(record)
+
+
 def _build_logger() -> logging.Logger:
-    handler = logging.StreamHandler(sys.stderr)
+    handler = _BarAwareHandler(sys.stderr)
     handler.setFormatter(
         _ColoredFormatter(
             "%(asctime)s │ %(colored_levelname)s │ %(message)s",
@@ -224,9 +262,7 @@ class _TokenBucketRateLimiter:
         log.info("  Global backoff lifted — resuming downloads")
 
 
-# ─── Progress display (print-lock protected) ─────────────────────────────────
-
-_print_lock = threading.Lock()
+# ─── Progress display ────────────────────────────────────────────────────────
 
 
 def _elapsed_str(start: Optional[float]) -> str:
@@ -241,6 +277,7 @@ def _elapsed_str(start: Optional[float]) -> str:
 
 
 def _print_progress(prog: _Progress) -> None:
+    global _current_bar
     snap = prog.snapshot()
     total = snap["total"]
     if total == 0:
@@ -257,9 +294,9 @@ def _print_progress(prog: _Progress) -> None:
         rate_str = f" | RL: {snap['rate_limited']}" if snap["rate_limited"] else ""
         skip_str = f" | Skip: {snap['skipped_downloads']}" if snap["skipped_downloads"] else ""
         msg = (
-            f"\033[2K\rDownloading: |{bar}| {pct}% "
+            f"\r\033[2KDownloading: |{bar}| {pct}% "
             f"({current}/{total}) Fail:{snap['failed_downloads']}"
-            f"{skip_str}{rate_str} [{elapsed}]    "
+            f"{skip_str}{rate_str} [{elapsed}]"
         )
     else:
         current = snap["metadata_ok"] + snap["metadata_errors"]
@@ -267,12 +304,23 @@ def _print_progress(prog: _Progress) -> None:
         bar = "█" * filled + "░" * (bar_width - filled)
         pct = int(100 * current / total)
         msg = (
-            f"\033[2K\rMetadata: |{bar}| {pct}% "
-            f"({current}/{total}) Err:{snap['metadata_errors']} [{elapsed}]    "
+            f"\r\033[2KMetadata: |{bar}| {pct}% "
+            f"({current}/{total}) Err:{snap['metadata_errors']} [{elapsed}]"
         )
 
     with _print_lock:
-        print(msg, end="", flush=True, file=sys.stderr)
+        _current_bar = msg
+        sys.stderr.write(msg)
+        sys.stderr.flush()
+
+
+def _clear_bar() -> None:
+    """Erase the progress bar — call before printing a final blank line."""
+    global _current_bar
+    with _print_lock:
+        _current_bar = ""
+        sys.stderr.write("\r\033[2K")
+        sys.stderr.flush()
 
 
 # ─── Session factory ──────────────────────────────────────────────────────────
@@ -1014,7 +1062,7 @@ def update_metadata(outputs: list[dict], prog: _Progress) -> None:
 
             _print_progress(prog)
 
-    print(file=sys.stderr)  # newline after progress bar
+    _clear_bar()
     prog.set("metadata_updated", updated)
     prog.set("metadata_skipped", skipped)
 
@@ -1235,7 +1283,6 @@ def main() -> None:
 
     prog = _Progress()
     prog.set("start_time", time.time())
-    print(file=sys.stderr)
 
     all_outputs: list[dict] = []
 
@@ -1253,7 +1300,7 @@ def main() -> None:
             all_outputs.extend(outputs)
         prog.set("download_end_time", time.time())
 
-    print(file=sys.stderr)
+    _clear_bar()
 
     if not args.skip_metadata:
         update_metadata(all_outputs, prog)
@@ -1265,7 +1312,7 @@ def main() -> None:
     )
 
     snap = prog.snapshot()
-    print(file=sys.stderr)
+    _clear_bar()
     log.info("═" * 60)
     log.info("EXTRACTION COMPLETE")
     log.info("═" * 60)
@@ -1284,7 +1331,8 @@ if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        print("\n\nInterrupted.", file=sys.stderr)
+        _clear_bar()
+        log.warning("Interrupted by user.")
         sys.exit(130)
     except Exception as exc:
         log.critical(f"Fatal: {exc}", exc_info=True)
